@@ -14,17 +14,30 @@ import { appsManifest } from "../support/apps-release.ts";
  * shared parts cannot finish within the scenario deadline. `nested` is 20,000 levels deep: a
  * recursive check overflows the stack and the evaluation fails. Neither schema is parsed, so
  * only construction is exercised; `source.route` shows a shared definition still validates.
+ * `paint` nests imported schemas inside framework schemas: its listed input describes each one
+ * where it sits, except a document with references, which reads differently away from its root.
  */
+const color = { type: "string", enum: ["red", "blue"] };
 const source = `
-import { defineApp, dynamicRouter, jsonSchema, query, router } from "apps";
+import { array, defineApp, dynamicRouter, jsonSchema, object, query, router } from "apps";
 const address = { type: "object", properties: { city: { type: "string" } }, required: ["city"], additionalProperties: false };
 const route = { type: "object", properties: { home: address, work: address }, required: ["home", "work"], additionalProperties: false };
 let shared = { type: "string" };
 for (let level = 0; level < 30; level++) shared = { anyOf: [shared, shared] };
 let nested = { type: "string" };
 for (let level = 0; level < 20000; level++) nested = { not: nested };
+const color = ${JSON.stringify(color)};
+const linked = { $defs: { color }, type: "object", properties: { color: { $ref: "#/$defs/color" } } };
 export default defineApp({}, {
   tools: router({
+    paint: query({
+      input: object({
+        color: jsonSchema(color),
+        palette: array(jsonSchema(color)),
+        accent: jsonSchema(color).optional(),
+        linked: jsonSchema(linked).optional(),
+      }),
+    }, async (_, input) => JSON.stringify(input)),
     source: dynamicRouter({
       list: async () => [{ name: "route", description: "Echo a route", inputSchema: route, readOnly: true }],
       resolve: async (name) => {
@@ -68,6 +81,40 @@ layer(HostedLive, { excludeTestServices: true })("Imported JSON Schemas", (it) =
         }
         const invalid = yield* call({ home: { city: "Springfield" }, work: {} });
         expect(invalid.status, JSON.stringify(invalid.body)).not.toBe(200);
+        const catalog = yield* body(
+          Schema.Struct({
+            items: Schema.Array(
+              Schema.Struct({
+                name: Schema.String,
+                inputSchema: Schema.Struct({
+                  properties: Schema.Unknown,
+                  required: Schema.Array(Schema.String),
+                }),
+              }),
+            ),
+          }),
+          yield* api.request(actors.owner, "GET", `${path}/tools`),
+        );
+        const listed = catalog.items.find((tool) => tool.name === "paint")?.inputSchema;
+        expect(listed?.properties).toEqual({
+          color,
+          palette: { type: "array", items: color },
+          accent: { anyOf: [color, { type: "null" }] },
+          linked: { anyOf: [{}, { type: "null" }] },
+        });
+        expect(listed?.required).toEqual(["color", "palette"]);
+        const paint = (input: unknown) =>
+          api.request(actors.owner, "POST", `${path}/tools/call`, { tool: "paint", input });
+        expect((yield* paint({ color: "red", palette: ["blue"] })).status).toBe(200);
+        for (const input of [
+          { color: "green", palette: [] },
+          { color: "red", palette: ["green"] },
+          { color: "red", palette: [], accent: "green" },
+          { color: "red", palette: [], linked: { color: "green" } },
+        ]) {
+          const rejected = yield* paint(input);
+          expect(rejected.status, JSON.stringify(rejected.body)).not.toBe(200);
+        }
       }),
     ),
   );

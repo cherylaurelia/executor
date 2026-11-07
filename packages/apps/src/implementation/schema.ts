@@ -7,6 +7,7 @@ import {
   SchemaGetter,
   SchemaIssue,
   SchemaParser,
+  SchemaTransformation,
 } from "effect";
 import {
   deepCompareStrict,
@@ -412,6 +413,12 @@ const rootDefinitions = (schema: JsonObject): JsonObject | undefined => {
     }
   }
   return definitions;
+};
+
+/** A schema with no references or identifiers, which reads the same under any root. */
+const isStandalone = (schema: JsonObject) => {
+  const definitions = rootDefinitions(schema);
+  return definitions !== undefined && Object.keys(definitions).length === 0;
 };
 
 /**
@@ -1446,6 +1453,23 @@ const lazyCompiledDecoder = (document: () => JsonObject) => {
         Effect.mapError(() => new SchemaIssue.InvalidValue({ message: "Unsupported JSON Schema" })),
         Effect.flatMap((schema) => SchemaParser.decodeUnknownEffect(schema)(input, options)),
       ),
+    {
+      // Describe the document where the schema is nested too, as `Schema.Date` describes its
+      // string. A document with references or identifiers reads differently away from its
+      // root, so it stays undescribed there.
+      toCodecJson: () =>
+        EffectSchema.link<EffectSchema.Json>()(
+          EffectSchema.Json.check(
+            EffectSchema.makeFilter(() => true, {
+              toJsonSchema: () => {
+                const document = read();
+                return isStandalone(document) ? document : [{}, true];
+              },
+            }),
+          ),
+          SchemaTransformation.passthrough(),
+        ),
+    },
   );
   return { decoder: withLazyJsonSchemaDocument(decoder, read), compile };
 };
